@@ -15,14 +15,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from relbench.base import Dataset, RecommendationTask, TaskType
-from relbench.datasets import get_dataset
+from relbench.datasets import dataset_registry, get_dataset
 from relbench.modeling.graph import (
     get_link_train_table_input,
     make_pkey_fkey_graph,
 )
 from relbench.modeling.loader import SparseTensor
 from relbench.modeling.utils import get_stype_proposal
-from relbench.tasks import get_task
+from relbench.tasks import get_task, task_registry
 from torch import Tensor
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
@@ -52,21 +52,49 @@ parser.add_argument("--channels", type=int, default=128)
 parser.add_argument("--aggr", type=str, default="sum")
 parser.add_argument("--num_layers", type=int, default=4)
 parser.add_argument("--num_neighbors", type=int, default=128)
+parser.add_argument("--rhs_sample_size", type=int, default=None)
 parser.add_argument("--temporal_strategy", type=str, default="last")
 parser.add_argument("--max_steps_per_epoch", type=int, default=2000)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--cache_dir", type=str,
                     default=os.path.expanduser("~/.cache/relbench_examples"))
+parser.add_argument(
+    "--relbench_cache_dir",
+    type=str,
+    default=None,
+    help="Use an existing RelBench dataset cache directory instead of downloading.",
+)
 args = parser.parse_args()
+
+if args.rhs_sample_size is not None:
+    if args.rhs_sample_size <= 0:
+        raise ValueError("--rhs_sample_size must be a positive integer.")
+    if args.model != "contextgnn":
+        raise ValueError("--rhs_sample_size is only supported for contextgnn.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
     torch.set_num_threads(1)
 seed_everything(args.seed)
 
-dataset: Dataset = get_dataset(args.dataset, download=True)
-task: RecommendationTask = get_task(args.dataset, args.task, download=True)
+if args.relbench_cache_dir is not None:
+    dataset_cls, dataset_args, dataset_kwargs = dataset_registry[args.dataset]
+    dataset_kwargs = {**dataset_kwargs, "cache_dir": args.relbench_cache_dir}
+    dataset_registry[args.dataset] = (dataset_cls, dataset_args, dataset_kwargs)
+
+    task_cls, task_args, task_kwargs = task_registry[args.dataset][args.task]
+    task_kwargs = {
+        **task_kwargs,
+        "cache_dir": f"{args.relbench_cache_dir}/tasks/{args.task}",
+    }
+    task_registry[args.dataset][args.task] = (task_cls, task_args, task_kwargs)
+
+dataset: Dataset = get_dataset(args.dataset,
+                               download=args.relbench_cache_dir is None)
+task: RecommendationTask = get_task(args.dataset,
+                                    args.task,
+                                    download=args.relbench_cache_dir is None)
 tune_metric = "link_prediction_map"
 assert task.task_type == TaskType.LINK_PREDICTION
 
@@ -149,6 +177,7 @@ elif args.model == "contextgnn":
             "channels": 128,
             "num_layers": 4,
         },
+        rhs_sample_size=args.rhs_sample_size,
     ).to(device)
 elif args.model == 'shallowrhsgnn':
     model = ShallowRHSGNN(
@@ -204,6 +233,13 @@ def train() -> float:
 
             loss = F.binary_cross_entropy_with_logits(out, target)
             numel = out.numel()
+        elif args.model == 'contextgnn' and args.rhs_sample_size is not None:
+            logits, lhs_y_batch, rhs_y_index = model.forward_sample_softmax(
+                batch, task.src_entity_table, task.dst_entity_table, src_batch,
+                dst_index)
+            edge_label_index = torch.stack([lhs_y_batch, rhs_y_index], dim=0)
+            loss = sparse_cross_entropy(logits, edge_label_index)
+            numel = len(batch[task.dst_entity_table].batch)
         elif args.model in ['contextgnn', 'shallowrhsgnn']:
             logits = model(batch, task.src_entity_table, task.dst_entity_table)
             edge_label_index = torch.stack([src_batch, dst_index], dim=0)
@@ -217,7 +253,7 @@ def train() -> float:
         count_accum += numel
 
         steps += 1
-        if steps > args.max_steps_per_epoch:
+        if steps >= args.max_steps_per_epoch:
             break
 
     if count_accum == 0:
@@ -259,7 +295,7 @@ def test(loader: NeighborLoader, desc: str) -> np.ndarray:
 
 
 state_dict = None
-best_val_metric = 0
+best_val_metric = float("-inf")
 for epoch in range(1, args.epochs + 1):
     train_loss = train()
     if epoch % args.eval_epochs_interval == 0:

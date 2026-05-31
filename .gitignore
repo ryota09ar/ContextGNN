@@ -21,3 +21,6 @@ venv/*
 data/**
 .data/**
 results/**
+*.err
+*.log
+*.out

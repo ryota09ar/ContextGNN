@@ -36,6 +36,7 @@ dev=[
     "pre-commit",
 ]
 full=[
+    "pandas<3",
     "relbench==1.1.0",
     "sentence-transformers",
     "optuna",

@@ -8,9 +8,12 @@ from torch import Tensor
 
 class GloveTextEmbedding:
     def __init__(self, device: Optional[torch.device] = None):
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = str(device)
         self.model = SentenceTransformer(
             "sentence-transformers/average_word_embeddings_glove.6B.300d",
-            device=str(device),
+            **kwargs,
         )
 
     def __call__(self, sentences: List[str]) -> Tensor:
