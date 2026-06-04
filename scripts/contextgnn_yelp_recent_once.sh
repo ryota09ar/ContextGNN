@@ -2,13 +2,14 @@
 
 #SBATCH --job-name=contextgnn_yelp_recent_once
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:a6000:1
+#SBATCH --gres=gpus:1
 #SBATCH --time=10:00:00
 #SBATCH --error=slurm_contextgnn_yelp_recent_once.err
 #SBATCH --output=slurm_contextgnn_yelp_recent_once.out
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate contextgnn
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 ensure_pyg_neighbor_sampler_backend() {
   python - <<'PY'
@@ -83,6 +84,8 @@ fi
 
 DATA_DIR="$PWD/data/cache/yelp/transductive_recent_2020-02-01"
 SAVE_DIR="$PWD/result/yelp_contextgnn_recent_once"
+export MPLCONFIGDIR="$SAVE_DIR/matplotlib"
+export XDG_CACHE_HOME="$SAVE_DIR/xdg_cache"
 
 if [ ! -f "$DATA_DIR/metadata.pt" ] || \
    [ ! -f "$DATA_DIR/train.pt" ] || \
@@ -106,4 +109,5 @@ python examples/yelp_contextgnn.py \
   --max_steps_per_epoch 2000 \
   --eval_k 20 \
   --filter_train_items \
+  --analyze_score_modes \
   --save_dir "$SAVE_DIR"

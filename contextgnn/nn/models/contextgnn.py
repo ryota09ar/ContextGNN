@@ -124,13 +124,26 @@ class ContextGNN(RHSEmbeddingGNN):
     def construct_logits(self, lhs_embedding_projected, lhs_embedding,
                          rhs_gnn_embedding, rhs_embedding, lhs_idgnn_batch,
                          rhs_idgnn_index):
-        embgnn_logits = lhs_embedding_projected @ rhs_embedding.t(
+        return self.construct_logit_components(
+            lhs_embedding_projected,
+            lhs_embedding,
+            rhs_gnn_embedding,
+            rhs_embedding,
+            lhs_idgnn_batch,
+            rhs_idgnn_index,
+        )["fused"]
+
+    def construct_logit_components(self, lhs_embedding_projected,
+                                   lhs_embedding, rhs_gnn_embedding,
+                                   rhs_embedding, lhs_idgnn_batch,
+                                   rhs_idgnn_index) -> Dict[str, Tensor]:
+        two_tower_logits = lhs_embedding_projected @ rhs_embedding.t(
         )  # batch_size, num_rhs_nodes
 
         # Model the importance of embedding-GNN prediction for each lhs node
         embgnn_offset_logits = self.lin_offset_embgnn(
             lhs_embedding_projected).flatten()
-        embgnn_logits += embgnn_offset_logits.view(-1, 1)
+        two_tower_logits = two_tower_logits + embgnn_offset_logits.view(-1, 1)
 
         # Calculate idgnn logits
         idgnn_logits = self.head(
@@ -148,8 +161,16 @@ class ContextGNN(RHSEmbeddingGNN):
             lhs_embedding_projected).flatten()
         idgnn_logits = idgnn_logits + idgnn_offset_logits[lhs_idgnn_batch]
 
-        embgnn_logits[lhs_idgnn_batch, rhs_idgnn_index] = idgnn_logits
-        return embgnn_logits
+        gnn_only_logits = torch.full_like(two_tower_logits, -float("inf"))
+        gnn_only_logits[lhs_idgnn_batch, rhs_idgnn_index] = idgnn_logits
+
+        fused_logits = two_tower_logits.clone()
+        fused_logits[lhs_idgnn_batch, rhs_idgnn_index] = idgnn_logits
+        return {
+            "fused": fused_logits,
+            "two_tower": two_tower_logits,
+            "gnn_only": gnn_only_logits,
+        }
 
     def forward_gnn(
         self,
@@ -174,6 +195,28 @@ class ContextGNN(RHSEmbeddingGNN):
         )
         return x_dict
 
+    def get_idgnn_rhs_inputs(
+        self,
+        batch: HeteroData,
+        dst_table: NodeType,
+        rhs_gnn_embedding_all: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        dst_store = batch[dst_table]
+        if ("contextgnn_lhs_batch" in dst_store
+                and "contextgnn_rhs_local_index" in dst_store
+                and "contextgnn_rhs_global_index" in dst_store):
+            rhs_local_index = dst_store.contextgnn_rhs_local_index
+            return (
+                rhs_gnn_embedding_all[rhs_local_index],
+                dst_store.contextgnn_rhs_global_index,
+                dst_store.contextgnn_lhs_batch,
+            )
+        return (
+            rhs_gnn_embedding_all,
+            batch.n_id_dict[dst_table],
+            batch.batch_dict[dst_table],
+        )
+
     def forward(
         self,
         batch: HeteroData,
@@ -187,9 +230,8 @@ class ContextGNN(RHSEmbeddingGNN):
         lhs_embedding = x_dict[entity_table][:
                                              batch_size]  # batch_size, channel
         lhs_embedding_projected = self.lhs_projector(lhs_embedding)
-        rhs_gnn_embedding = x_dict[dst_table]  # num_sampled_rhs, channel
-        rhs_idgnn_index = batch.n_id_dict[dst_table]  # num_sampled_rhs
-        lhs_idgnn_batch = batch.batch_dict[dst_table]  # batch_size
+        rhs_gnn_embedding, rhs_idgnn_index, lhs_idgnn_batch = (
+            self.get_idgnn_rhs_inputs(batch, dst_table, x_dict[dst_table]))
 
         rhs_embedding = self.rhs_embedding()  # num_rhs_nodes, channel
         embgnn_logits = self.construct_logits(lhs_embedding_projected,
@@ -197,6 +239,30 @@ class ContextGNN(RHSEmbeddingGNN):
                                               rhs_embedding, lhs_idgnn_batch,
                                               rhs_idgnn_index)
         return embgnn_logits
+
+    def forward_components(
+        self,
+        batch: HeteroData,
+        entity_table: NodeType,
+        dst_table: NodeType,
+    ) -> Dict[str, Tensor]:
+        seed_time = batch[entity_table].seed_time
+        x_dict = self.forward_gnn(batch, entity_table)
+
+        batch_size = seed_time.size(0)
+        lhs_embedding = x_dict[entity_table][:batch_size]
+        lhs_embedding_projected = self.lhs_projector(lhs_embedding)
+        rhs_gnn_embedding, rhs_idgnn_index, lhs_idgnn_batch = (
+            self.get_idgnn_rhs_inputs(batch, dst_table, x_dict[dst_table]))
+        rhs_embedding = self.rhs_embedding()
+        return self.construct_logit_components(
+            lhs_embedding_projected,
+            lhs_embedding,
+            rhs_gnn_embedding,
+            rhs_embedding,
+            lhs_idgnn_batch,
+            rhs_idgnn_index,
+        )
 
     def forward_sample_softmax(
         self,
@@ -214,9 +280,8 @@ class ContextGNN(RHSEmbeddingGNN):
         lhs_embedding = x_dict[entity_table][:
                                              batch_size]  # batch_size, channel
         lhs_embedding_projected = self.lhs_projector(lhs_embedding)
-        rhs_gnn_embedding = x_dict[dst_table]  # num_sampled_rhs, channel
-        rhs_idgnn_index = batch.n_id_dict[dst_table]  # num_sampled_rhs
-        lhs_idgnn_batch = batch.batch_dict[dst_table]  # batch_size
+        rhs_gnn_embedding, rhs_idgnn_index, lhs_idgnn_batch = (
+            self.get_idgnn_rhs_inputs(batch, dst_table, x_dict[dst_table]))
 
         (rhs_idgnn_index, rhs_embedding, lhs_idgnn_batch, rhs_gnn_embedding,
          lhs_y_batch, rhs_y_index) = self.sample_step(rhs_idgnn_index,
