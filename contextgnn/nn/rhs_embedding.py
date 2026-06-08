@@ -67,7 +67,7 @@ class RHSEmbedding(torch.nn.Module):
         self._cached_rhs_embedding = None
 
     def forward(self, index: Optional[Tensor] = None) -> Tensor:
-        if not self.training:
+        if not self.training and index is None:
             if self._cached_rhs_embedding is not None:
                 return self._cached_rhs_embedding
         outs = []
@@ -89,7 +89,7 @@ class RHSEmbedding(torch.nn.Module):
             outs.append(out)
         result = sum(outs)
         assert isinstance(result, Tensor)
-        if not self.training:
+        if not self.training and index is None:
             self._cached_rhs_embedding = result
         return result
 

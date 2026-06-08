@@ -73,13 +73,14 @@ class ContextGNN(RHSEmbeddingGNN):
             num_layers=1,
         )
         self.lhs_projector = torch.nn.Linear(channels, embedding_dim)
+        self.rhs_to_gnn_projector = torch.nn.Linear(
+            embedding_dim, channels, bias=False)
 
         self.id_awareness_emb = torch.nn.Embedding(1, channels)
-        self.lin_offset_idgnn = torch.nn.Linear(embedding_dim, 1)
-        self.lin_offset_embgnn = torch.nn.Linear(embedding_dim, 1)
         self.channels = channels
         self.num_rhs_nodes = num_nodes
         self.rhs_sample_size = rhs_sample_size
+        self.dst_entity_table = dst_entity_table
 
         self.reset_parameters()
 
@@ -91,9 +92,8 @@ class ContextGNN(RHSEmbeddingGNN):
         self.head.reset_parameters()
         self.id_awareness_emb.reset_parameters()
         self.rhs_embedding.reset_parameters()
-        self.lin_offset_embgnn.reset_parameters()
-        self.lin_offset_idgnn.reset_parameters()
         self.lhs_projector.reset_parameters()
+        self.rhs_to_gnn_projector.reset_parameters()
 
     def sample_step(self, rhs_idgnn_index, lhs_idgnn_batch, rhs_gnn_embedding,
                     lhs_y_batch, rhs_y_index):
@@ -140,26 +140,13 @@ class ContextGNN(RHSEmbeddingGNN):
         two_tower_logits = lhs_embedding_projected @ rhs_embedding.t(
         )  # batch_size, num_rhs_nodes
 
-        # Model the importance of embedding-GNN prediction for each lhs node
-        embgnn_offset_logits = self.lin_offset_embgnn(
-            lhs_embedding_projected).flatten()
-        two_tower_logits = two_tower_logits + embgnn_offset_logits.view(-1, 1)
+        lhs_gnn_embedding = lhs_embedding[lhs_idgnn_batch]
 
-        # Calculate idgnn logits
-        idgnn_logits = self.head(
-            rhs_gnn_embedding).flatten()  # num_sampled_rhs
-        # Because we are only doing 2 hop, we are not really sampling info from
-        # lhs therefore, we need to incorporate this information using
-        # lhs_embedding[lhs_idgnn_batch] * rhs_gnn_embedding
+        # Pair-wise score plus the user-specific local preference alpha_v.
+        idgnn_logits = self.head(lhs_gnn_embedding).flatten()
         idgnn_logits += (
-            lhs_embedding[lhs_idgnn_batch] *  # num_sampled_rhs, channel
-            rhs_gnn_embedding).sum(
-                dim=-1).flatten()  # num_sampled_rhs, channel
-
-        # Model the importance of ID-GNN prediction for each lhs node
-        idgnn_offset_logits = self.lin_offset_idgnn(
-            lhs_embedding_projected).flatten()
-        idgnn_logits = idgnn_logits + idgnn_offset_logits[lhs_idgnn_batch]
+            lhs_gnn_embedding * rhs_gnn_embedding
+        ).sum(dim=-1).flatten()
 
         gnn_only_logits = torch.full_like(two_tower_logits, -float("inf"))
         gnn_only_logits[lhs_idgnn_batch, rhs_idgnn_index] = idgnn_logits
@@ -179,6 +166,15 @@ class ContextGNN(RHSEmbeddingGNN):
     ):
         seed_time = batch[entity_table].seed_time
         x_dict = self.encoder(batch.tf_dict)
+
+        # Inject shallow RHS embeddings into every sampled destination node
+        # before message passing so ID/feature embeddings receive GNN gradients.
+        rhs_node_ids = batch.n_id_dict[self.dst_entity_table]
+        rhs_shallow_embedding = self.rhs_embedding(rhs_node_ids)
+        x_dict[self.dst_entity_table] = (
+            x_dict[self.dst_entity_table]
+            + self.rhs_to_gnn_projector(rhs_shallow_embedding)
+        )
 
         # Add ID-awareness to the root node
         x_dict[entity_table][:seed_time.size(0
@@ -273,6 +269,25 @@ class ContextGNN(RHSEmbeddingGNN):
         dst_index: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         r"""Forward function with RHS sample softmax."""
+        components, lhs_y_batch, rhs_y_index = (
+            self.forward_sample_softmax_components(
+                batch,
+                entity_table,
+                dst_table,
+                src_batch,
+                dst_index,
+            ))
+        return components["fused"], lhs_y_batch, rhs_y_index
+
+    def forward_sample_softmax_components(
+        self,
+        batch: HeteroData,
+        entity_table: NodeType,
+        dst_table: NodeType,
+        src_batch: Optional[Tensor] = None,
+        dst_index: Optional[Tensor] = None,
+    ) -> Tuple[Dict[str, Tensor], Tensor, Tensor]:
+        r"""Return fused and branch logits with the same sampled RHS nodes."""
         seed_time = batch[entity_table].seed_time
         x_dict = self.forward_gnn(batch, entity_table)
 
@@ -288,11 +303,15 @@ class ContextGNN(RHSEmbeddingGNN):
                                                       lhs_idgnn_batch,
                                                       rhs_gnn_embedding,
                                                       src_batch, dst_index)
-        embgnn_logits = self.construct_logits(lhs_embedding_projected,
-                                              lhs_embedding, rhs_gnn_embedding,
-                                              rhs_embedding, lhs_idgnn_batch,
-                                              rhs_idgnn_index)
-        return embgnn_logits, lhs_y_batch, rhs_y_index
+        components = self.construct_logit_components(
+            lhs_embedding_projected,
+            lhs_embedding,
+            rhs_gnn_embedding,
+            rhs_embedding,
+            lhs_idgnn_batch,
+            rhs_idgnn_index,
+        )
+        return components, lhs_y_batch, rhs_y_index
 
     def to(self, *args, **kwargs) -> Self:
         return super().to(*args, **kwargs)

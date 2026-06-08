@@ -52,11 +52,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--filter_train_items", action="store_true")
+    parser.add_argument("--train_positive_tower_rate", type=float, default=0.5)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--analyze_score_modes", action="store_true")
     parser.add_argument("--analysis_dir", type=str, default=None)
     parser.add_argument("--analysis_scatter_limit", type=int, default=5000)
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not 0.0 <= args.train_positive_tower_rate <= 1.0:
+        raise ValueError("--train_positive_tower_rate must be in [0, 1].")
 
 
 def make_embedding_tf(feat: Tensor, col_name: str) -> TensorFrame:
@@ -89,17 +95,54 @@ def clear_rhs_cache(model: ContextGNN) -> None:
     model.rhs_embedding._cached_rhs_embedding = None
 
 
+def route_local_positive_logits_to_tower(
+    components: Dict[str, Tensor],
+    lhs_y_batch: Tensor,
+    rhs_y_index: Tensor,
+    tower_rate: float,
+) -> Tuple[Tensor, int, int]:
+    """Route a random subset of local positive labels to two-tower logits."""
+    fused_logits = components["fused"]
+    if rhs_y_index.numel() == 0:
+        return fused_logits, 0, 0
+
+    positive_gnn_logits = components["gnn_only"][lhs_y_batch, rhs_y_index]
+    local_positive_mask = torch.isfinite(positive_gnn_logits)
+    num_local_positives = int(local_positive_mask.sum().item())
+    if num_local_positives == 0:
+        return fused_logits, 0, 0
+    if tower_rate <= 0.0:
+        return fused_logits, 0, num_local_positives
+
+    tower_mask = local_positive_mask & (
+        torch.rand(local_positive_mask.size(), device=local_positive_mask.device)
+        < tower_rate
+    )
+    num_tower_positives = int(tower_mask.sum().item())
+    if num_tower_positives == 0:
+        return fused_logits, 0, num_local_positives
+
+    routed_logits = fused_logits.clone()
+    routed_logits[lhs_y_batch[tower_mask], rhs_y_index[tower_mask]] = (
+        components["two_tower"][lhs_y_batch[tower_mask], rhs_y_index[tower_mask]]
+    )
+    return routed_logits, num_tower_positives, num_local_positives
+
+
 def attach_contextgnn_batch_fields(
     batch: HeteroData,
     num_hops: int,
 ) -> HeteroData:
+    """Add ContextGNN pair-wise score targets for sampled local items."""
     batch_size = batch["user"].batch_size
     device = batch["user"].n_id.device
-    batch["user"].seed_time = torch.zeros(batch_size, device=device)
+    batch["user"].seed_time = torch.zeros(
+        batch_size, dtype=batch["user"].time.dtype, device=device)
 
-    user_batch = torch.zeros(batch["user"].num_nodes, dtype=torch.long)
-    user_batch[:batch_size] = torch.arange(batch_size)
-    batch["user"].batch = user_batch.to(device)
+    user_batch = torch.zeros(
+        batch["user"].num_nodes, dtype=torch.long, device=device)
+    user_batch[:batch_size] = torch.arange(batch_size, device=device)
+    batch["user"].batch = user_batch
 
     item_reach: Dict[int, Set[int]] = {}
     active_users: Dict[int, Set[int]] = {
@@ -162,10 +205,10 @@ def attach_contextgnn_batch_fields(
     batch["item"].contextgnn_rhs_local_index = contextgnn_rhs_local_index
     batch["item"].contextgnn_rhs_global_index = contextgnn_rhs_global_index
 
-    # Kept for temporal encoding compatibility. Candidate scoring uses the
-    # pair-level fields above because one item can belong to multiple seed rows.
-    item_batch = torch.zeros(batch["item"].num_nodes, dtype=torch.long)
-    batch["item"].batch = item_batch.to(device)
+    # Only needed to keep temporal encoding's batch indexing valid. Yelp time is
+    # always zero, so this does not affect time features.
+    batch["item"].batch = torch.zeros(
+        batch["item"].num_nodes, dtype=torch.long, device=device)
     return batch
 
 
@@ -209,8 +252,8 @@ def build_data(metadata: dict) -> Tuple[HeteroData, Dict[str, dict]]:
     data = HeteroData()
     data["user"].num_nodes = num_users
     data["item"].num_nodes = num_items
-    data["user"].time = torch.zeros(num_users)
-    data["item"].time = torch.zeros(num_items)
+    data["user"].time = torch.zeros(num_users, dtype=torch.long)
+    data["item"].time = torch.zeros(num_items, dtype=torch.long)
     data["user"].tf = make_embedding_tf(user_feat, "user_history_embedding")
     data["item"].tf = make_embedding_tf(item_feat, "item_embedding")
     data["user", "rates", "item"].edge_index = torch.stack(
@@ -242,10 +285,11 @@ def make_loader(
     shuffle: bool,
     num_workers: int,
 ) -> NeighborLoader:
+    input_user_ids = user_ids.unique(sorted=True)
     return NeighborLoader(
         data,
         num_neighbors=num_neighbors,
-        input_nodes=("user", user_ids.unique(sorted=True)),
+        input_nodes=("user", input_user_ids),
         subgraph_type="bidirectional",
         batch_size=batch_size,
         shuffle=shuffle,
@@ -780,6 +824,7 @@ def analyze_score_modes(
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -842,11 +887,12 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = total_count = steps = 0
+        routed_tower_positives = 0
+        local_positives = 0
         total_steps = min(len(loaders["train"]), args.max_steps_per_epoch)
 
         for batch in tqdm(loaders["train"], total=total_steps, desc="Train"):
             batch = batch.to(device)
-            batch = attach_contextgnn_batch_fields(batch, args.num_layers)
             input_user_ids = batch["user"].n_id[:batch["user"].batch_size].cpu()
             src_batch, dst_index = batch_positives(
                 input_user_ids,
@@ -856,9 +902,18 @@ def main() -> None:
             if dst_index.numel() == 0:
                 continue
 
+            batch = attach_contextgnn_batch_fields(batch, args.num_layers)
+
             optimizer.zero_grad()
-            logits, lhs_y_batch, rhs_y_index = model.forward_sample_softmax(
-                batch, "user", "item", src_batch, dst_index)
+            components, lhs_y_batch, rhs_y_index = (
+                model.forward_sample_softmax_components(
+                    batch, "user", "item", src_batch, dst_index))
+            logits, num_routed, num_local = route_local_positive_logits_to_tower(
+                components,
+                lhs_y_batch,
+                rhs_y_index,
+                args.train_positive_tower_rate,
+            )
             edge_label_index = torch.stack([lhs_y_batch, rhs_y_index], dim=0)
             loss = sparse_cross_entropy(logits, edge_label_index)
             loss.backward()
@@ -867,11 +922,17 @@ def main() -> None:
             count = int(batch["user"].batch_size)
             total_loss += float(loss.detach()) * count
             total_count += count
+            routed_tower_positives += num_routed
+            local_positives += num_local
             steps += 1
             if steps >= args.max_steps_per_epoch:
                 break
 
         train_loss = total_loss / total_count if total_count else float("nan")
+        route_msg = (
+            f", tower-routed local positives: {routed_tower_positives}/"
+            f"{local_positives}"
+        )
         if epoch % args.eval_epochs_interval == 0:
             valid_metrics = evaluate(
                 model=model,
@@ -884,7 +945,8 @@ def main() -> None:
                 filter_train_items=args.filter_train_items,
                 desc="Valid",
             )
-            print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, "
+            print(f"Epoch: {epoch:02d}, Train loss: {train_loss}"
+                  f"{route_msg}, "
                   f"Valid metrics: {valid_metrics}")
 
             valid_metric = valid_metrics[f"map@{args.eval_k}"]

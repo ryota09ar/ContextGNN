@@ -126,6 +126,13 @@ def test_contextgnn(tmp_path, emb_mode):
     assert logits.shape[0] == batch_size
     assert logits.shape[1] == train_table_input.num_dst_nodes
 
+    model.zero_grad()
+    x_dict = model.forward_gnn(batch, task.src_entity_table)
+    x_dict[task.dst_entity_table].sum().backward()
+    assert model.rhs_to_gnn_projector.weight.grad is not None
+    if model.rhs_embedding.lookup_embedding is not None:
+        assert model.rhs_embedding.lookup_embedding.weight.grad is not None
+
 
 @pytest.mark.parametrize('emb_mode', list(RHSEmbeddingMode))
 def test_contextgnn_sample_softmax(tmp_path, emb_mode):
@@ -194,6 +201,12 @@ def test_contextgnn_sample_softmax(tmp_path, emb_mode):
 
     assert logits.shape[0] == batch_size
     assert logits.shape[1] == rhs_sample_size
+
+    components, _, _ = model.forward_sample_softmax_components(
+        batch, task.src_entity_table, task.dst_entity_table, src_batch,
+        dst_index)
+    assert components["fused"].shape == (batch_size, rhs_sample_size)
+    assert components["two_tower"].shape == (batch_size, rhs_sample_size)
 
 
 @pytest.mark.parametrize('emb_mode', list(RHSEmbeddingMode))

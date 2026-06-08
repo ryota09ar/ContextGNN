@@ -2,7 +2,7 @@
 
 #SBATCH --job-name=contextgnn_yelp_recent_once
 #SBATCH --mem=32G
-#SBATCH --gres=gpus:1
+#SBATCH --gres=gpu:1
 #SBATCH --time=10:00:00
 #SBATCH --error=slurm_contextgnn_yelp_recent_once.err
 #SBATCH --output=slurm_contextgnn_yelp_recent_once.out
@@ -106,6 +106,7 @@ python examples/yelp_contextgnn.py \
   --num_layers 4 \
   --num_neighbors 128 \
   --rhs_sample_size 1000 \
+  --train_positive_tower_rate 0.5 \
   --max_steps_per_epoch 2000 \
   --eval_k 20 \
   --filter_train_items \
